@@ -27,7 +27,7 @@ import {
   nowIso,
   todayIso,
 } from "@/lib/seed";
-import { mergeImportedItinerary, parseItineraryCsv } from "@/lib/itinerary-import";
+import { parseItineraryCsv, type ItineraryImportResult } from "@/lib/itinerary-import";
 import { downloadJson } from "@/lib/storage";
 import type {
   CostLevel,
@@ -77,6 +77,12 @@ interface TripSummary {
   updatedAt: string;
 }
 
+interface PendingItineraryImport {
+  fileName: string;
+  imported: ItineraryImportResult;
+  suggestedName: string;
+}
+
 export function TravelOperatorApp() {
   const [loaded, setLoaded] = useState(false);
   const [user, setUser] = useState<AuthUser | null>(null);
@@ -94,6 +100,7 @@ export function TravelOperatorApp() {
   const [weather, setWeather] = useState<WeatherSummary>(emptyWeather);
   const [weatherLoading, setWeatherLoading] = useState(false);
   const [recommendationLoading, setRecommendationLoading] = useState(false);
+  const [pendingItineraryImport, setPendingItineraryImport] = useState<PendingItineraryImport | null>(null);
   const [status, setStatus] = useState("");
 
   useEffect(() => {
@@ -336,32 +343,46 @@ export function TravelOperatorApp() {
         return;
       }
 
-      const merged = mergeImportedItinerary({
-        existingStops: stops,
-        existingOptions: options,
+      setPendingItineraryImport({
+        fileName: file.name,
         imported,
+        suggestedName: inferTripNameFromImport(file.name, imported),
       });
-
-      const newOptions = merged.options.filter(
-        (option) => !options.some((existing) => existing.id === option.id),
-      );
-
-      setStops(merged.stops);
-      setOptions(merged.options);
-      setActiveStopId(findMergedStopId(merged.stops, imported.stops[0]) ?? merged.stops[0]?.id ?? "");
-
-      await persistTravelData({ stops: merged.stops, options: merged.options });
-
       setStatus(
-        `Itinerary imported: ${imported.stops.length} stops and ${newOptions.length} new options from ${imported.totalRows} rows. ${
+        `Itinerary ready: ${imported.stops.length} stops and ${imported.options.length} options from ${imported.totalRows} rows. ${
           imported.skippedRows ? `${imported.skippedRows} rows skipped.` : ""
-        }`,
+        } Choose whether to save it as a new trip or replace the current trip.`,
       );
     } catch {
       setStatus("Itinerary import failed. Export your Google Sheet as CSV with a place/city column and try again.");
     } finally {
       event.target.value = "";
     }
+  }
+
+  async function createTripFromPendingItinerary(name: string) {
+    if (!pendingItineraryImport) return;
+    const cleanName = name.trim() || pendingItineraryImport.suggestedName || "Imported trip";
+    const created = await fetchJson<{ trip: Pick<TripSummary, "id" | "name"> }>("/api/trips", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: cleanName }),
+    });
+    const data = makeTravelDataFromItinerary(pendingItineraryImport.imported, familyProfile);
+    await saveCloudTravelData(created.trip.id, data);
+    setPendingItineraryImport(null);
+    await loadTripsAndData(created.trip.id);
+    setStatus(`Imported itinerary saved as new trip: ${created.trip.name}.`);
+  }
+
+  async function replaceCurrentTripWithPendingItinerary() {
+    if (!pendingItineraryImport || !activeTripId) return;
+    const data = makeTravelDataFromItinerary(pendingItineraryImport.imported, familyProfile);
+    await saveCloudTravelData(activeTripId, data);
+    applyTravelData(data);
+    setHydratedTripId(activeTripId);
+    setPendingItineraryImport(null);
+    setStatus(`Current trip replaced with ${pendingItineraryImport.imported.stops.length} imported stops.`);
   }
 
   async function persistTravelData(patch: Partial<TravelDataExport>) {
@@ -584,6 +605,7 @@ export function TravelOperatorApp() {
           trips={trips}
           archivedTrips={archivedTrips}
           activeTripId={activeTripId}
+          pendingItineraryImport={pendingItineraryImport}
           onExport={handleExport}
           onImport={handleImport}
           onItineraryImport={handleItineraryImport}
@@ -593,6 +615,12 @@ export function TravelOperatorApp() {
           onArchiveTrip={archiveActiveTrip}
           onRestoreTrip={restoreArchivedTrip}
           onDeleteTrip={deleteTrip}
+          onCreateTripFromItinerary={createTripFromPendingItinerary}
+          onReplaceTripWithItinerary={replaceCurrentTripWithPendingItinerary}
+          onCancelItineraryImport={() => {
+            setPendingItineraryImport(null);
+            setStatus("Itinerary import cancelled.");
+          }}
         />
       ) : null}
 
@@ -1289,6 +1317,7 @@ function DataScreen({
   trips,
   archivedTrips,
   activeTripId,
+  pendingItineraryImport,
   onExport,
   onImport,
   onItineraryImport,
@@ -1298,11 +1327,15 @@ function DataScreen({
   onArchiveTrip,
   onRestoreTrip,
   onDeleteTrip,
+  onCreateTripFromItinerary,
+  onReplaceTripWithItinerary,
+  onCancelItineraryImport,
 }: {
   runs: RecommendationRun[];
   trips: TripSummary[];
   archivedTrips: TripSummary[];
   activeTripId: string;
+  pendingItineraryImport: PendingItineraryImport | null;
   onExport: () => Promise<void>;
   onImport: (event: ChangeEvent<HTMLInputElement>) => Promise<void>;
   onItineraryImport: (event: ChangeEvent<HTMLInputElement>) => Promise<void>;
@@ -1312,13 +1345,22 @@ function DataScreen({
   onArchiveTrip: () => Promise<void>;
   onRestoreTrip: (tripId: string) => Promise<void>;
   onDeleteTrip: (tripId: string) => Promise<void>;
+  onCreateTripFromItinerary: (name: string) => Promise<void>;
+  onReplaceTripWithItinerary: () => Promise<void>;
+  onCancelItineraryImport: () => void;
 }) {
   const [newTripName, setNewTripName] = useState("");
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteRole, setInviteRole] = useState<"editor" | "viewer">("editor");
   const [manageBusy, setManageBusy] = useState<string | null>(null);
+  const [itineraryTripName, setItineraryTripName] = useState("");
   const activeTrip = trips.find((trip) => trip.id === activeTripId);
   const canManageActiveTrip = activeTrip?.role === "owner";
+  const canEditActiveTrip = activeTrip?.role === "owner" || activeTrip?.role === "editor";
+
+  useEffect(() => {
+    setItineraryTripName(pendingItineraryImport?.suggestedName ?? "");
+  }, [pendingItineraryImport?.suggestedName]);
 
   return (
     <div className="grid gap-5 lg:grid-cols-[0.9fr_1.1fr]">
@@ -1502,6 +1544,63 @@ function DataScreen({
             <input className="sr-only" type="file" accept=".csv,.tsv,text/csv,text/tab-separated-values" onChange={onItineraryImport} />
           </label>
         </div>
+        {pendingItineraryImport ? (
+          <div className="mt-4 rounded-lg border border-[var(--line)] bg-white p-3">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold">Itinerary ready to save</p>
+                <p className="mt-1 text-xs leading-5 text-[var(--muted)]">
+                  {pendingItineraryImport.fileName} · {pendingItineraryImport.imported.stops.length} stops ·{" "}
+                  {pendingItineraryImport.imported.options.length} options
+                  {pendingItineraryImport.imported.skippedRows ? ` · ${pendingItineraryImport.imported.skippedRows} rows skipped` : ""}
+                </p>
+              </div>
+              <button
+                className="focus-ring inline-flex h-9 items-center justify-center rounded-lg border border-[var(--line)] bg-white px-3 text-sm font-semibold"
+                onClick={onCancelItineraryImport}
+              >
+                Cancel
+              </button>
+            </div>
+            <div className="mt-3 grid gap-3">
+              <TextField label="New trip name" value={itineraryTripName} onChange={setItineraryTripName} />
+              <div className="grid gap-2 sm:grid-cols-2">
+                <button
+                  className="focus-ring inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-[var(--accent)] px-4 font-semibold text-white disabled:opacity-60"
+                  disabled={!itineraryTripName.trim() || manageBusy !== null}
+                  onClick={async () => {
+                    setManageBusy("itinerary:new");
+                    try {
+                      await onCreateTripFromItinerary(itineraryTripName);
+                    } finally {
+                      setManageBusy(null);
+                    }
+                  }}
+                >
+                  <Plus size={17} />
+                  {manageBusy === "itinerary:new" ? "Saving" : "Save as new trip"}
+                </button>
+                <button
+                  className="focus-ring inline-flex h-11 items-center justify-center gap-2 rounded-lg border border-[rgba(163,59,43,0.35)] bg-white px-4 font-semibold text-[var(--danger)] disabled:opacity-50"
+                  disabled={!canEditActiveTrip || manageBusy !== null}
+                  onClick={async () => {
+                    if (!activeTrip) return;
+                    if (!window.confirm(`Replace "${activeTrip.name}" with this imported itinerary? Existing stops, options, check-ins, and recommendation history will be removed.`)) return;
+                    setManageBusy("itinerary:replace");
+                    try {
+                      await onReplaceTripWithItinerary();
+                    } finally {
+                      setManageBusy(null);
+                    }
+                  }}
+                >
+                  <RefreshCcw size={17} />
+                  {manageBusy === "itinerary:replace" ? "Replacing" : `Replace ${activeTrip?.name ?? "current trip"}`}
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
       </section>
 
       <section className="rounded-lg border border-[var(--line)] bg-[var(--panel)] p-4 shadow-sm">
@@ -1667,17 +1766,6 @@ function pickCurrentStop(stops: TripStop[]) {
   return stops.find((stop) => stop.startDate <= today && (!stop.endDate || stop.endDate >= today));
 }
 
-function findMergedStopId(stops: TripStop[], importedStop?: TripStop) {
-  if (!importedStop) return undefined;
-  return stops.find(
-    (stop) =>
-      stop.place.trim().toLowerCase() === importedStop.place.trim().toLowerCase() &&
-      stop.country.trim().toLowerCase() === importedStop.country.trim().toLowerCase() &&
-      stop.startDate === importedStop.startDate &&
-      stop.endDate === importedStop.endDate,
-  )?.id;
-}
-
 function makeTravelData({
   familyProfile,
   stops,
@@ -1702,6 +1790,16 @@ function makeTravelData({
   };
 }
 
+function makeTravelDataFromItinerary(imported: ItineraryImportResult, familyProfile: FamilyProfile) {
+  return makeTravelData({
+    familyProfile,
+    stops: imported.stops,
+    options: imported.options,
+    checkIns: [],
+    recommendationRuns: [],
+  });
+}
+
 function makeBlankTravelData(): TravelDataExport {
   return makeTravelData({
     familyProfile: {
@@ -1716,6 +1814,22 @@ function makeBlankTravelData(): TravelDataExport {
     checkIns: [],
     recommendationRuns: [],
   });
+}
+
+function inferTripNameFromImport(fileName: string, imported: ItineraryImportResult) {
+  const cleanedFileName = fileName
+    .replace(/\.[^.]+$/, "")
+    .replace(/\s*-\s*sheet\d*$/i, "")
+    .replace(/\s*sheet\d*$/i, "")
+    .trim();
+
+  if (cleanedFileName) return cleanedFileName;
+
+  const firstStop = imported.stops[0];
+  const lastStop = imported.stops[imported.stops.length - 1];
+  if (firstStop && lastStop && firstStop.id !== lastStop.id) return `${firstStop.place} to ${lastStop.place}`;
+  if (firstStop) return firstStop.place;
+  return "Imported trip";
 }
 
 async function saveCloudTravelData(tripId: string, data: TravelDataExport) {
