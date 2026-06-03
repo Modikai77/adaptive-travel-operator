@@ -642,9 +642,6 @@ function AuthScreen({
           Sign in with Google
         </a>
 
-        <p className="mt-4 text-xs leading-5 text-[var(--muted)]">
-          You need `DATABASE_URL` in `.env.local` before accounts can be created. Google sign-in also needs `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
-        </p>
       </section>
     </main>
   );
