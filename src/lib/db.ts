@@ -52,10 +52,12 @@ export async function ensureSchema() {
       id text primary key,
       name text not null,
       owner_id text not null references app_users(id) on delete cascade,
+      archived_at timestamptz,
       created_at timestamptz not null default now(),
       updated_at timestamptz not null default now()
     )
   `;
+  await db`alter table trips add column if not exists archived_at timestamptz`;
   await db`
     create table if not exists trip_memberships (
       trip_id text not null references trips(id) on delete cascade,
@@ -100,6 +102,7 @@ export async function ensureSchema() {
   `;
   await db`create index if not exists app_sessions_user_id_idx on app_sessions(user_id)`;
   await db`create index if not exists app_sessions_expires_at_idx on app_sessions(expires_at)`;
+  await db`create index if not exists trips_archived_at_idx on trips(archived_at)`;
   await db`create index if not exists trip_memberships_user_id_idx on trip_memberships(user_id)`;
   await db`create index if not exists trip_invitations_email_idx on trip_invitations(email)`;
   await db`create unique index if not exists travel_data_trip_id_idx on travel_data(trip_id)`;

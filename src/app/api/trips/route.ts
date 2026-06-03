@@ -2,10 +2,11 @@ import { NextResponse } from "next/server";
 import { requireUser } from "@/lib/auth";
 import { createTrip, listTrips } from "@/lib/trips-db";
 
-export async function GET() {
+export async function GET(request: Request) {
   try {
     const user = await requireUser();
-    const trips = await listTrips(user.id, user.email);
+    const includeArchived = new URL(request.url).searchParams.get("includeArchived") === "true";
+    const trips = await listTrips(user.id, user.email, { includeArchived });
     return NextResponse.json({ trips });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unauthorized";

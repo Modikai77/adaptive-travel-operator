@@ -72,6 +72,7 @@ interface TripSummary {
   name: string;
   role: "owner" | "editor" | "viewer";
   ownerId: string;
+  archivedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -80,6 +81,7 @@ export function TravelOperatorApp() {
   const [loaded, setLoaded] = useState(false);
   const [user, setUser] = useState<AuthUser | null>(null);
   const [trips, setTrips] = useState<TripSummary[]>([]);
+  const [archivedTrips, setArchivedTrips] = useState<TripSummary[]>([]);
   const [activeTripId, setActiveTripId] = useState("");
   const [hydratedTripId, setHydratedTripId] = useState("");
   const [activeTab, setActiveTab] = useState<TabId>("today");
@@ -137,7 +139,11 @@ export function TravelOperatorApp() {
     }
 
     setTrips(tripList);
-    const nextTripId = preferredTripId ?? activeTripId ?? tripList[0]?.id ?? "";
+    const allTrips = (await fetchJson<{ trips: TripSummary[] }>("/api/trips?includeArchived=true")).trips;
+    setArchivedTrips(allTrips.filter((trip) => trip.archivedAt));
+    const preferredAvailable = preferredTripId && tripList.some((trip) => trip.id === preferredTripId) ? preferredTripId : "";
+    const activeAvailable = activeTripId && tripList.some((trip) => trip.id === activeTripId) ? activeTripId : "";
+    const nextTripId = preferredAvailable || activeAvailable || tripList[0]?.id || "";
     setActiveTripId(nextTripId);
     applyTravelData(makeBlankTravelData());
 
@@ -398,6 +404,41 @@ export function TravelOperatorApp() {
     setStatus(`Invitation saved for ${email}. They can sign in with that email to access this trip.`);
   }
 
+  async function archiveActiveTrip() {
+    if (!activeTripId) return;
+    const tripName = trips.find((trip) => trip.id === activeTripId)?.name ?? "Trip";
+    await fetchJson<{ ok: true }>("/api/trips/manage", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tripId: activeTripId, action: "archive" }),
+    });
+    await loadTripsAndData();
+    setStatus(`${tripName} archived.`);
+  }
+
+  async function restoreArchivedTrip(tripId: string) {
+    const tripName = archivedTrips.find((trip) => trip.id === tripId)?.name ?? "Trip";
+    await fetchJson<{ ok: true }>("/api/trips/manage", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tripId, action: "restore" }),
+    });
+    await loadTripsAndData(tripId);
+    setStatus(`${tripName} restored.`);
+  }
+
+  async function deleteTrip(tripId: string) {
+    const tripName =
+      trips.find((trip) => trip.id === tripId)?.name ?? archivedTrips.find((trip) => trip.id === tripId)?.name ?? "Trip";
+    await fetchJson<{ ok: true }>("/api/trips/manage", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tripId, action: "delete" }),
+    });
+    await loadTripsAndData(tripId === activeTripId ? undefined : activeTripId);
+    setStatus(`${tripName} deleted.`);
+  }
+
   if (!loaded) {
     return (
       <main className="mx-auto flex min-h-screen max-w-5xl items-center justify-center px-5">
@@ -541,6 +582,7 @@ export function TravelOperatorApp() {
         <DataScreen
           runs={recommendationRuns}
           trips={trips}
+          archivedTrips={archivedTrips}
           activeTripId={activeTripId}
           onExport={handleExport}
           onImport={handleImport}
@@ -548,6 +590,9 @@ export function TravelOperatorApp() {
           onSwitchTrip={switchTrip}
           onCreateTrip={createNewTrip}
           onInvite={inviteToActiveTrip}
+          onArchiveTrip={archiveActiveTrip}
+          onRestoreTrip={restoreArchivedTrip}
+          onDeleteTrip={deleteTrip}
         />
       ) : null}
 
@@ -1242,6 +1287,7 @@ function ProfileScreen({ profile, onSave }: { profile: FamilyProfile; onSave: (p
 function DataScreen({
   runs,
   trips,
+  archivedTrips,
   activeTripId,
   onExport,
   onImport,
@@ -1249,9 +1295,13 @@ function DataScreen({
   onSwitchTrip,
   onCreateTrip,
   onInvite,
+  onArchiveTrip,
+  onRestoreTrip,
+  onDeleteTrip,
 }: {
   runs: RecommendationRun[];
   trips: TripSummary[];
+  archivedTrips: TripSummary[];
   activeTripId: string;
   onExport: () => Promise<void>;
   onImport: (event: ChangeEvent<HTMLInputElement>) => Promise<void>;
@@ -1259,11 +1309,16 @@ function DataScreen({
   onSwitchTrip: (tripId: string) => Promise<void>;
   onCreateTrip: (name: string) => Promise<void>;
   onInvite: (email: string, role: "editor" | "viewer") => Promise<void>;
+  onArchiveTrip: () => Promise<void>;
+  onRestoreTrip: (tripId: string) => Promise<void>;
+  onDeleteTrip: (tripId: string) => Promise<void>;
 }) {
   const [newTripName, setNewTripName] = useState("");
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteRole, setInviteRole] = useState<"editor" | "viewer">("editor");
+  const [manageBusy, setManageBusy] = useState<string | null>(null);
   const activeTrip = trips.find((trip) => trip.id === activeTripId);
+  const canManageActiveTrip = activeTrip?.role === "owner";
 
   return (
     <div className="grid gap-5 lg:grid-cols-[0.9fr_1.1fr]">
@@ -1285,6 +1340,48 @@ function DataScreen({
               ))}
             </select>
           </label>
+          {activeTrip ? (
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--line)] pb-3">
+              <div>
+                <p className="text-sm font-semibold">{activeTrip.name}</p>
+                <p className="text-xs text-[var(--muted)]">Role: {activeTrip.role}</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  className="focus-ring inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-[var(--line)] bg-white px-3 text-sm font-semibold disabled:opacity-50"
+                  disabled={!canManageActiveTrip || manageBusy !== null}
+                  onClick={async () => {
+                    if (!window.confirm(`Archive "${activeTrip.name}"? It will move out of Current trip.`)) return;
+                    setManageBusy(`archive:${activeTrip.id}`);
+                    try {
+                      await onArchiveTrip();
+                    } finally {
+                      setManageBusy(null);
+                    }
+                  }}
+                >
+                  <Archive size={16} />
+                  {manageBusy === `archive:${activeTrip.id}` ? "Archiving" : "Archive"}
+                </button>
+                <button
+                  className="focus-ring inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-[rgba(163,59,43,0.35)] bg-white px-3 text-sm font-semibold text-[var(--danger)] disabled:opacity-50"
+                  disabled={!canManageActiveTrip || manageBusy !== null}
+                  onClick={async () => {
+                    if (!window.confirm(`Delete "${activeTrip.name}" permanently? This removes its stops, options, check-ins, and recommendation history.`)) return;
+                    setManageBusy(`delete:${activeTrip.id}`);
+                    try {
+                      await onDeleteTrip(activeTrip.id);
+                    } finally {
+                      setManageBusy(null);
+                    }
+                  }}
+                >
+                  <Trash2 size={16} />
+                  {manageBusy === `delete:${activeTrip.id}` ? "Deleting" : "Delete"}
+                </button>
+              </div>
+            </div>
+          ) : null}
           <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
             <TextField label="New trip name" value={newTripName} onChange={setNewTripName} />
             <button
@@ -1332,6 +1429,54 @@ function DataScreen({
               Invited people get access when they sign in with the same email. Editors can change the trip; viewers can open it read-only.
             </p>
           </div>
+          {archivedTrips.length ? (
+            <div className="border-t border-[var(--line)] pt-3">
+              <p className="text-sm font-semibold">Archived trips</p>
+              <div className="mt-3 grid gap-2">
+                {archivedTrips.map((trip) => (
+                  <div key={trip.id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[var(--line)] bg-white p-3">
+                    <div>
+                      <p className="text-sm font-semibold">{trip.name}</p>
+                      <p className="text-xs text-[var(--muted)]">Archived {new Date(trip.archivedAt ?? trip.updatedAt).toLocaleDateString()}</p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        className="focus-ring inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-[var(--line)] bg-white px-3 text-sm font-semibold disabled:opacity-50"
+                        disabled={trip.role !== "owner" || manageBusy !== null}
+                        onClick={async () => {
+                          setManageBusy(`restore:${trip.id}`);
+                          try {
+                            await onRestoreTrip(trip.id);
+                          } finally {
+                            setManageBusy(null);
+                          }
+                        }}
+                      >
+                        <RefreshCcw size={15} />
+                        {manageBusy === `restore:${trip.id}` ? "Restoring" : "Restore"}
+                      </button>
+                      <button
+                        className="focus-ring inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-[rgba(163,59,43,0.35)] bg-white px-3 text-sm font-semibold text-[var(--danger)] disabled:opacity-50"
+                        disabled={trip.role !== "owner" || manageBusy !== null}
+                        onClick={async () => {
+                          if (!window.confirm(`Delete "${trip.name}" permanently? This removes its stops, options, check-ins, and recommendation history.`)) return;
+                          setManageBusy(`delete:${trip.id}`);
+                          try {
+                            await onDeleteTrip(trip.id);
+                          } finally {
+                            setManageBusy(null);
+                          }
+                        }}
+                      >
+                        <Trash2 size={15} />
+                        {manageBusy === `delete:${trip.id}` ? "Deleting" : "Delete"}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
         </div>
       </section>
 
